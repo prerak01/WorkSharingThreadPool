@@ -7,14 +7,11 @@ namespace cottonruntime{
 	void join(int n);
 	
 	// function executed by each thread spawned
-	void *routine(void*);
-
-	// locks the mutex
-	void lock(pthread_mutex_t*m);
-	
-	// unlocks the mutex
-	void unlock(pthread_mutex_t*m);
+	void *routine(void*p);
 
 	// excutes a task by popping it from the taskpool(queue) 
 	void executeTask();
+
+	// returns the private key of thread
+	int getThread();
 }

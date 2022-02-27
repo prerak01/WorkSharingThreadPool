@@ -1,6 +1,6 @@
 /*
 
-			COTTON - Library based Work-Sharing concurrency platform
+			COTTON++ - Library based Work-Stealing concurrency platform
 It supports very basic async-finish parallelism. It supports “flat finish” scopes.
 A flat-finish scope is a single-level finish scope for all async tasks spawned within its scope
 (i.e., an async task can recursively create new async tasks, but it can never spawn new finish
@@ -17,123 +17,218 @@ scopes)
 #include <pthread.h>
 #include <unistd.h>
 
-// Queue size is set to QUEUE_SIZE
-const int QUEUE_SIZE = 999999;
+const int QUEUE_SIZE = 10000;
+//#define debug
 
-#define debug
+#ifdef debug
+float misses = 0;
+float hits = 0;
+#endif
 
-// Global variables
-
-volatile int shutdown = 0;
-pthread_mutex_t finish_mutex, queue_mutex;
-int threads;
+// Global Variables
+pthread_key_t globalkey;
+pthread_mutex_t finish_mutex;
+int totalThreads;
 pthread_t *thread_store;
-pthread_cond_t cond;
-std::function<void()> *queue[QUEUE_SIZE];
-int size, start, end;
-volatile int finish_counter;
+volatile int shutdown = 0, finish_counter;
+
+// Class representing Deck/Deque
+class Deque
+{
+	volatile int start, end, size;
+	std::function<void()> **queue;
+	pthread_mutex_t queue_mutex;
+
+public:
+	// Constructor for Deque class
+	Deque()
+	{
+		size = 0;
+		start = 0;
+		end = 0;
+		pthread_mutex_init(&queue_mutex, NULL);
+		queue = (std::function<void()> **)malloc(sizeof(std::function<void()> *) * QUEUE_SIZE);
+	}
+
+	// Method to push task to its task queue by the thread from the tail
+	void push(std::function<void()> *pointer)
+	{	pthread_mutex_lock(&queue_mutex);
+		if (size >= QUEUE_SIZE)
+		{
+			perror("queue overflow exiting..");
+			exit(-1);
+		}
+		queue[end] = pointer;
+		end = (end + 1) % QUEUE_SIZE;
+		size++;
+		pthread_mutex_unlock(&queue_mutex);
+	}
+
+	// Method to steal(pop) task from the head by some other thread
+	std::function<void()> *FIFOpoll()
+	{
+		std::function<void()> *temp = (std::function<void()> *)malloc(sizeof(std::function<void()>));
+		temp = NULL;
+		pthread_mutex_lock(&queue_mutex);
+		if (size > 0)
+		{
+			temp = *(queue + start);
+			start = (start + 1) % QUEUE_SIZE;
+			size--;
+		}
+		pthread_mutex_unlock(&queue_mutex);
+		return temp;
+	}
+
+	// Method to pop task from the tail by the thread
+	std::function<void()> *LIFOpoll()
+	{
+		std::function<void()> *temp = (std::function<void()> *)malloc(sizeof(std::function<void()>));
+		temp = NULL;
+		pthread_mutex_lock(&queue_mutex);
+		if (size > 0)
+		{
+			end = (end - 1) % QUEUE_SIZE;
+			temp = *(queue + end);
+			size--;
+		}
+		pthread_mutex_unlock(&queue_mutex);
+		return temp;
+	}
+};
+
+
+// Class representing all the queues in a container dequeContainer
+class dequeContainter
+{
+	Deque *store;
+
+public:
+// Parametrized Constructor of dequeContainer
+	dequeContainter(int threads)
+	{
+		store = (Deque *)malloc(sizeof(Deque) * threads);
+		for (int i = 0; i < threads; i++)
+			*(store + i) = Deque();
+	}
+
+	dequeContainter() {}
+
+// Method to push task to taskPool of thread with private key(which we get using getThread) 
+	void push(std::function<void()> *task)
+	{
+		// printf("%d ",cottonruntime::getThread());
+		(store + cottonruntime::getThread())->push(task);
+	}
+
+// Method to pop task from its own taskPool by the thread with private key(which we get using getThread) 
+	std::function<void()> *poll()
+	{
+		return (store + cottonruntime::getThread())->LIFOpoll();
+	}
+
+// Method to steal a task from a taskPool of other threads by choosing a taskPool randomly
+	std::function<void()> *steal()
+	{
+		int mine = cottonruntime::getThread();
+
+		int toSteal = rand() % totalThreads;
+		while (toSteal == mine)
+		{
+			toSteal = rand() % totalThreads;
+		}
+		return (store + toSteal)->FIFOpoll();
+	}
+};
+
+dequeContainter deque;
 
 // Initialising all the data structures and variables
 void cotton::init_runtime()
 {
-	// Initialization of mutex and condition variables
-	pthread_mutex_init(&queue_mutex, NULL);
 	pthread_mutex_init(&finish_mutex, NULL);
-	pthread_cond_init(&cond, NULL);
+	srand(time(0));
 
-	/*
-	default number of threads is 1
-	*/
 	if (getenv("COTTON_WORKERS") != NULL)
-		threads = atoi(getenv("COTTON_WORKERS"));
+		totalThreads = atoi(getenv("COTTON_WORKERS"));
 	else
-		threads = 1;
-	printf("total threads %d\n", threads);
+		totalThreads = 1;
 
-	// Initializing variables for our taskPool(queue)
-	size = 0;
-	start = 0;
-	end = 0;
+	printf("total threads %d \n\n", totalThreads);
 
-	// storing pthread_t for 1 less (excluding main thread)
-	thread_store = (pthread_t *)malloc(sizeof(pthread_t) * (threads - 1));
+	// initializing container deque
+	deque = dequeContainter(totalThreads);
 
-	// creating threads-1 new threads
-	cottonruntime::spawn(threads);
+	// binding threads to particular value
+	pthread_key_create(&globalkey, NULL);
+	int *p = (int *)malloc(sizeof(int));
+	*p = 0;
+	pthread_setspecific(globalkey, (void *)p);
+
+	thread_store = (pthread_t *)malloc(sizeof(pthread_t) * (totalThreads - 1));
+
+	// spawn will also pass values which need to be assigned to each thread
+	cottonruntime::spawn(totalThreads);
 }
 
-// Starting the finish scope
-void cotton::start_finish()
-{ // Setting the finish_counter to 0
-	cottonruntime::lock(&finish_mutex);
-	finish_counter = 0;
-	cottonruntime::unlock(&finish_mutex);
-}
-
-// Ending the finish scope
-void cotton::end_finish()
-{ // while loop continues until finish counter > 0 i.e. until the taskpool is non-empty
-	while (finish_counter != 0)
-	{ // Thread executes a task by poping it from the taskpool
-		cottonruntime::executeTask();
-	}
-}
-
-// Freeing the resources before exiting the program
-void cotton::finalize_runtime()
-{ // shutdown is set to 1 so that no more threads execute routine()
-	shutdown = 1;
-	pthread_cond_broadcast(&cond);
-
-	cottonruntime::join(threads);
-
-	// Destroying the mutex and cond variables
-	pthread_mutex_destroy(&finish_mutex);
-	pthread_mutex_destroy(&queue_mutex);
-	pthread_cond_destroy(&cond);
-}
-
-// Asynchronous function to copy task to heap, getting pointer to that task and saving it to queue
-void cotton::async(std::function<void()> &&lambda)
+// Helper function to get the private key of the thread
+int cottonruntime::getThread()
 {
-	cottonruntime::lock(&finish_mutex);
-	finish_counter++;
-	cottonruntime::unlock(&finish_mutex);
-
-	// Allocation of memory in heap
-	std::function<void()> *pointer = (std::function<void()> *)malloc(sizeof(lambda));
-	memcpy(pointer, &lambda, sizeof(lambda));
-
-	/*
-	Circular FIFO Queue implemented using arrays with both push and pop operations in O(1) time
-
-	*/
-	// Adding task to taskpool ( push task to queue)
-
-	// Use of mutex to avoid data races
-	cottonruntime::lock(&queue_mutex);
-
-	// If Queue is already full then simply exit the program
-	if (size == QUEUE_SIZE)
-	{
-		perror("queue overflow exiting");
-		exit(-1);
-	}
-
-	// Adding task to queue
-	size++;
-	queue[end] = pointer;
-	end++;
-	end %= QUEUE_SIZE;
-	pthread_cond_signal(&cond);
-	cottonruntime::unlock(&queue_mutex);
+	return *((int *)pthread_getspecific(globalkey));
 }
 
 // Helper Function to spawn n-1 threads
 void cottonruntime::spawn(int n)
 {
-	for (int i = 0; i < n - 1; i++)
-		pthread_create(thread_store + i, NULL, routine, NULL);
+	for (int i = 1; i < totalThreads; i++)
+	{
+		int *p = (int *)malloc(sizeof(int));
+		*p = i;
+		pthread_create(thread_store + i - 1, NULL, routine, (void *)p);
+	}
+}
+
+// Starting the finish scope
+void cotton::start_finish()
+{
+	// Setting the finish_counter to 0
+	pthread_mutex_lock(&finish_mutex);
+	finish_counter = 0;
+	pthread_mutex_unlock(&finish_mutex);
+}
+
+// Ending the finish scope
+void cotton::end_finish()
+{	// while loop continues until finish counter > 0
+	while (finish_counter != 0)
+	{// Thread executes a task by poping it from its taskpool 
+	// or stealing it from the taskpools of other threads
+		cottonruntime::executeTask();
+	}
+}
+
+// Destroying locks, condition variables, joining threads 
+void cotton::finalize_runtime()
+{	// shutdown is set to 1 so that no more threads execute routine()
+	shutdown = 1;
+	cottonruntime::join(totalThreads);
+	pthread_mutex_destroy(&finish_mutex);
+	// printf("Hit percentage %f\n", hits / (misses + hits));
+}
+
+// Asynchronous function to copy task to heap, getting pointer to that task and saving it to queue
+void cotton::async(std::function<void()> &&lambda)
+{
+	pthread_mutex_lock(&finish_mutex);
+	finish_counter++;
+	pthread_mutex_unlock(&finish_mutex);
+
+	// Allocation of memory in heap
+	std::function<void()> *pointer = (std::function<void()> *)malloc(sizeof(lambda));
+	memcpy(pointer, &lambda, sizeof(lambda));
+
+	// Adding a task to its taskpool by the thread( push task to queue)
+	deque.push(pointer);
 }
 
 // Helper Function to join n-1 threads
@@ -144,75 +239,48 @@ void cottonruntime::join(int n)
 }
 
 // Function to be run by each thread
-void *cottonruntime::routine(void *)
+void *cottonruntime::routine(void *p)
 {
-	// Loop until shutdown is 1
+	// Assigning key to thread
+	pthread_setspecific(globalkey, p);
+
 	while (shutdown != 1)
 	{
-		// Use of mutex locks to avoid data race
-		pthread_mutex_lock(&queue_mutex);
-		while (size == 0 && shutdown == 0)
-		{
-			pthread_cond_wait(&cond, &queue_mutex);
-		}
-		pthread_mutex_unlock(&queue_mutex);
-		// Thread executes a task by poping it from the taskpool
 		cottonruntime::executeTask();
 	}
 
 	return NULL;
 }
 
-// Helper function to lock a mutex
-void cottonruntime::lock(pthread_mutex_t *m)
-{
-	pthread_mutex_lock(m);
-}
-
-// Helper function to unlock a mutex
-void cottonruntime::unlock(pthread_mutex_t *m)
-{
-	pthread_mutex_unlock(m);
-}
-
-/*
-	Function to execute task by a thread by taking it from the taskpool
-*/
+// Function to execute task by a thread by taking it from his taskpool or from taskpools of other threads
 void cottonruntime::executeTask()
 {
-	std::function<void()> *p;
-	std::function<void()> task;
+	//Thread first tries to pop task from his own threadpool
+	std::function<void()> *p = deque.poll(); 
 
-	lock(&queue_mutex);
-
-	// If queue is empty then task is set to NULL and the thread returns
-	if (size == 0)
+	//If his taskpool is empty, thread tries to steal from taskpools of other threads 
+	if (p == NULL)
+		p = deque.steal();
+	if (p == NULL)
 	{
-		task = NULL;
-	}
-	else
-	{
-		// Task is taken from the front of the taskpool (queue) and stored in task
-		task = *queue[start];
-		p = queue[start];
+#ifdef debug
+		misses++;
+#endif
 
-		start++;
-		size--;
-		start %= QUEUE_SIZE;
-	}
-
-	unlock(&queue_mutex);
-
-	if (task == NULL)
 		return;
+	}
 
-	lock(&finish_mutex);
-	finish_counter--;
-	unlock(&finish_mutex);
+#ifdef debug
+	hits++;
+#endif
 
-	// Execution of task stored in task
+// Running task inside variable task
+	std::function<void()> task = *p;
 	task();
 
-	// Freeing p pointer
 	free(p);
+
+	pthread_mutex_lock(&finish_mutex);
+	finish_counter--;
+	pthread_mutex_unlock(&finish_mutex);
 }
